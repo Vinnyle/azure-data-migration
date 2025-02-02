@@ -23,4 +23,4 @@ Le script permet de migrer soit des **containers Blob**, soit des **Azure File S
 1. Clonez ce dépôt :
 
    ```bash
-   git clone https://github.com/votre-utilisateur/azure-data-migration.git
+   git clone https://github.com/Vinnyle/azure-data-migration.git
