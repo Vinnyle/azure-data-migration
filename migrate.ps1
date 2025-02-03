@@ -1,271 +1,550 @@
 <#
 .SYNOPSIS
-    Script interactif de migration des données entre comptes de stockage Azure.
+    Azure migration script with an interactive menu.
 
 .DESCRIPTION
-    Ce script permet de migrer des containers Blob ou des Azure File Shares d'un compte source vers un compte destination en utilisant AzCopy.
-    Il offre une interface interactive pour saisir les informations de connexion, lister les containers ou File Shares existants,
-    et effectuer la migration avec plusieurs vérifications (code de retour, intégrité MD5 pour les blobs, comparaison du nombre d'objets transférés).
+    This script migrates Blob containers or Azure File Shares from a source storage account
+    to a destination storage account. After entering the connection information (account name,
+    access key, and SAS token for each account), a main menu is displayed. The user can choose
+    between Blob migration or File Share migration. For each type, a submenu offers options to
+    scan the source, scan the destination, or initiate migration.
 
-.PARAMETER migrationType
-    Type de migration à effectuer : 'blob' pour les containers Blob ou 'fileshare' pour les Azure File Shares.
+    For each migration, the following occurs:
+      - The script checks if the resource exists on the destination.
+      - If not, it prompts the user whether to create it.
+          â€¢ For Blob containers: it retrieves the source properties (public access and metadata)
+            and, if confirmed, creates the container on the destination using the same settings.
+          â€¢ For File Shares: it retrieves the source properties (quota and metadata)
+            and, if confirmed, creates the File Share on the destination using the same settings.
+      - It computes an aggregated checksum for the resource on the source, then executes the migration
+        via AzCopy (with logs stored in a subfolder of a logs directory), and finally computes an
+        aggregated checksum on the destination.
+      - The two checksum values are then displayed and compared.
+         â€¢ For containers: the checksum is based on the concatenation (sorted by blob name) of each blobâ€™s
+           MD5 (or, if MD5 is not available, its content length), whose MD5 hash is then computed.
+         â€¢ For File Shares: the checksum is based on the concatenation (sorted by file name) of each fileâ€™s
+           size, then computing the MD5 hash of that string.
+      - Verification is done by comparing the two checksum values.
+      - All AzCopy logs are stored in a â€œlogsâ€ folder under the scriptâ€™s directory, in subfolders named with
+        the resource name and a timestamp.
+      - The Ctrl+C warning is displayed with yellow text on a black background.
 
-.NOTES
-    - Prérequis : Azure CLI et AzCopy installés.
-    - La vérification MD5 est appliquée pour la migration des containers Blob.
-    - Ce script est conçu pour être simple à utiliser et peut être adapté selon vos besoins.
+    **Note:** Yes/no questions accept â€œyesâ€ or â€œyâ€ for confirmation and â€œnoâ€ or â€œnâ€ for denial.
+    If AzCopy is not found in the PATH, the script will prompt you for the full path to azcopy.exe.
+
+    Prerequisites:
+      - Azure CLI must be installed and available in your PATH.
+      - AzCopy is required (or you must provide the path to azcopy.exe).
+      - The SAS tokens must be generated with the required permissions.
 #>
 
-# Demander le type de migration souhaité
-$migrationType = Read-Host "Quel type de migration souhaitez-vous effectuer ? Tapez 'blob' pour migrer des containers Blob ou 'fileshare' pour migrer des Azure File Shares"
+############################################
+# Setup Logging Folder
+############################################
+$LogRoot = Join-Path $PSScriptRoot "logs"
+if (!(Test-Path $LogRoot)) {
+    New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
+}
 
-# Demander les informations de connexion pour le compte SOURCE et le compte DESTINATION
-$sourceAccount = Read-Host "Entrez le nom du compte de stockage SOURCE"
-$sourceKey     = Read-Host "Entrez la clé d'accès du compte SOURCE"
-$sourceSas     = Read-Host "Entrez le SAS token du compte SOURCE (commencez par '?' par exemple)"
-
-$destinationAccount = Read-Host "Entrez le nom du compte de stockage DESTINATION"
-$destinationKey     = Read-Host "Entrez la clé d'accès du compte DESTINATION"
-$destinationSas     = Read-Host "Entrez le SAS token du compte DESTINATION (commencez par '?' par exemple)"
-
-if ($migrationType -eq "blob") {
-
-    Write-Output "`nMigration de containers Blob"
-
-    while ($true) {
-
-        Write-Output "`n-------------------------------"
-        Write-Output "Liste des containers du compte SOURCE ($sourceAccount) :"
-        try {
-            $sourceContainers = az storage container list --account-name $sourceAccount --account-key $sourceKey --query "[].name" -o tsv
-        }
-        catch {
-            Write-Output "Erreur lors de la récupération des containers du compte SOURCE."
-            break
-        }
-        if (-not $sourceContainers) {
-            Write-Output "Aucun container trouvé dans le compte SOURCE."
-            break
-        }
-        $sourceContainers | ForEach-Object { Write-Output " - $_" }
-
-        Write-Output "`nListe des containers du compte DESTINATION ($destinationAccount) :"
-        try {
-            $destinationContainers = az storage container list --account-name $destinationAccount --account-key $destinationKey --query "[].name" -o tsv
-        }
-        catch {
-            Write-Output "Erreur lors de la récupération des containers du compte DESTINATION."
-            break
-        }
-        if ($destinationContainers) {
-            $destinationContainers | ForEach-Object { Write-Output " - $_" }
+############################################
+# Helper Functions: Command Checks and Checksum Calculation
+############################################
+function Check-Command {
+    param(
+        [Parameter(Mandatory = $true)] [string]$CommandName,
+        [Parameter(Mandatory = $true)] [string]$InstallURL
+    )
+    if (-not (Get-Command $CommandName -ErrorAction SilentlyContinue)) {
+        Write-Host "`nThe command '$CommandName' was not found in your PATH."
+        $response = (Read-Host "Do you want to attempt to install '$CommandName'? (yes/no)").Trim().ToLower()
+        if ($response -eq "yes" -or $response -eq "y") {
+            Write-Host "Opening the installation page for '$CommandName' in your default browser..."
+            Start-Process $InstallURL
+            Write-Host "Please install '$CommandName' and then re-run this script."
+            exit
         }
         else {
-            Write-Output "Aucun container trouvé dans le compte DESTINATION."
-        }
-
-        # Sélection du container à migrer
-        $containerToCopy = Read-Host "`nEntrez le nom du container à migrer depuis le compte SOURCE (ou tapez 'exit' pour quitter)"
-        if ($containerToCopy -eq "exit") {
-            Write-Output "Fin du script."
-            break
-        }
-        if (-not ($sourceContainers -contains $containerToCopy)) {
-            Write-Output "Le container '$containerToCopy' n'existe pas dans le compte SOURCE. Veuillez réessayer."
-            continue
-        }
-
-        # Vérifier l'existence du container dans le compte DESTINATION
-        if (-not ($destinationContainers -contains $containerToCopy)) {
-            $createResponse = Read-Host "Le container '$containerToCopy' n'existe pas dans le compte DESTINATION. Voulez-vous le créer automatiquement ? (oui/non)"
-            if ($createResponse -eq "oui") {
-                Write-Output "Création du container '$containerToCopy' dans le compte DESTINATION..."
-                try {
-                    az storage container create --name $containerToCopy --account-name $destinationAccount --account-key $destinationKey | Out-Null
-                    Write-Output "Container '$containerToCopy' créé."
-                }
-                catch {
-                    Write-Output "Erreur lors de la création du container '$containerToCopy'."
-                    continue
-                }
-            }
-            else {
-                Write-Output "Migration annulée pour ce container. Veuillez choisir un autre container."
-                continue
-            }
-        }
-        else {
-            Write-Output "Le container '$containerToCopy' existe déjà dans le compte DESTINATION."
-        }
-
-        # Construction des URLs pour AzCopy avec vérification MD5
-        $sourceUrl      = "https://$sourceAccount.blob.core.windows.net/$containerToCopy$sourceSas"
-        $destinationUrl = "https://$destinationAccount.blob.core.windows.net/$containerToCopy$destinationSas"
-
-        Write-Output "`nDémarrage de la copie du container '$containerToCopy'..."
-        $azCopyCommand = "azcopy copy `"$sourceUrl`" `"$destinationUrl`" --recursive --check-md5=FailIfDifferent"
-        Write-Output "Exécution de la commande :"
-        Write-Output $azCopyCommand
-
-        try {
-            Invoke-Expression $azCopyCommand
-            if ($LASTEXITCODE -ne 0) {
-                Write-Output "Erreur lors de la copie du container '$containerToCopy'. Code de retour: $LASTEXITCODE"
-                continue
-            }
-        }
-        catch {
-            Write-Output "Exception lors de l'exécution de la commande AzCopy: $_"
-            continue
-        }
-
-        Write-Output "La copie du container '$containerToCopy' est terminée."
-
-        # Vérification du nombre de blobs transférés
-        try {
-            $sourceCount = az storage blob list --container-name $containerToCopy --account-name $sourceAccount --account-key $sourceKey --query "length([])" -o tsv
-            $destinationCount = az storage blob list --container-name $containerToCopy --account-name $destinationAccount --account-key $destinationKey --query "length([])" -o tsv
-        }
-        catch {
-            Write-Output "Erreur lors de la vérification des blobs transférés."
-            continue
-        }
-        Write-Output "Nombre de blobs dans le container SOURCE: $sourceCount"
-        Write-Output "Nombre de blobs dans le container DESTINATION: $destinationCount"
-        if ($sourceCount -ne $destinationCount) {
-            Write-Output "Attention : le nombre de blobs transférés ne correspond pas entre la source et la destination."
-        }
-        else {
-            Write-Output "Vérification réussie : le nombre de blobs correspond."
-        }
-
-        # Demander si l'utilisateur souhaite migrer un autre container Blob
-        $continueResponse = Read-Host "`nVoulez-vous migrer un autre container Blob ? (oui/non)"
-        if ($continueResponse -ne "oui") {
-            Write-Output "Fin du script de migration de containers Blob."
-            break
+            Write-Host "Cannot proceed without '$CommandName'. Exiting."
+            exit
         }
     }
 }
-elseif ($migrationType -eq "fileshare") {
 
-    Write-Output "`nMigration d'Azure File Shares"
-
-    while ($true) {
-
-        Write-Output "`n-------------------------------"
-        Write-Output "Liste des File Shares du compte SOURCE ($sourceAccount) :"
-        try {
-            $sourceShares = az storage share list --account-name $sourceAccount --account-key $sourceKey --query "[].name" -o tsv
-        }
-        catch {
-            Write-Output "Erreur lors de la récupération des File Shares du compte SOURCE."
-            break
-        }
-        if (-not $sourceShares) {
-            Write-Output "Aucun File Share trouvé dans le compte SOURCE."
-            break
-        }
-        $sourceShares | ForEach-Object { Write-Output " - $_" }
-
-        Write-Output "`nListe des File Shares du compte DESTINATION ($destinationAccount) :"
-        try {
-            $destinationShares = az storage share list --account-name $destinationAccount --account-key $destinationKey --query "[].name" -o tsv
-        }
-        catch {
-            Write-Output "Erreur lors de la récupération des File Shares du compte DESTINATION."
-            break
-        }
-        if ($destinationShares) {
-            $destinationShares | ForEach-Object { Write-Output " - $_" }
+function Check-AzCopy {
+    if (-not (Get-Command "azcopy" -ErrorAction SilentlyContinue)) {
+        Write-Host "`nAzCopy was not found in your PATH."
+        $response = (Read-Host "Do you want to provide the full path to azcopy.exe? (yes/no)").Trim().ToLower()
+        if ($response -eq "yes" -or $response -eq "y") {
+            $userPath = (Read-Host "Please enter the full path to azcopy.exe").Trim()
+            if (-not (Test-Path $userPath)) {
+                Write-Host "The provided path does not exist. Exiting."
+                exit
+            }
+            return $userPath
         }
         else {
-            Write-Output "Aucun File Share trouvé dans le compte DESTINATION."
-        }
-
-        # Sélection du File Share à migrer
-        $shareToCopy = Read-Host "`nEntrez le nom du File Share à migrer depuis le compte SOURCE (ou tapez 'exit' pour quitter)"
-        if ($shareToCopy -eq "exit") {
-            Write-Output "Fin du script."
-            break
-        }
-        if (-not ($sourceShares -contains $shareToCopy)) {
-            Write-Output "Le File Share '$shareToCopy' n'existe pas dans le compte SOURCE. Veuillez réessayer."
-            continue
-        }
-
-        # Vérifier l'existence du File Share dans le compte DESTINATION
-        if (-not ($destinationShares -contains $shareToCopy)) {
-            $createResponse = Read-Host "Le File Share '$shareToCopy' n'existe pas dans le compte DESTINATION. Voulez-vous le créer automatiquement ? (oui/non)"
-            if ($createResponse -eq "oui") {
-                Write-Output "Création du File Share '$shareToCopy' dans le compte DESTINATION..."
-                try {
-                    az storage share create --name $shareToCopy --account-name $destinationAccount --account-key $destinationKey | Out-Null
-                    Write-Output "File Share '$shareToCopy' créé."
-                }
-                catch {
-                    Write-Output "Erreur lors de la création du File Share '$shareToCopy'."
-                    continue
-                }
-            }
-            else {
-                Write-Output "Migration annulée pour ce File Share. Veuillez choisir un autre File Share."
-                continue
-            }
-        }
-        else {
-            Write-Output "Le File Share '$shareToCopy' existe déjà dans le compte DESTINATION."
-        }
-
-        # Construction des URLs pour AzCopy pour les File Shares
-        $sourceUrl      = "https://$sourceAccount.file.core.windows.net/$shareToCopy$sourceSas"
-        $destinationUrl = "https://$destinationAccount.file.core.windows.net/$shareToCopy$destinationSas"
-
-        Write-Output "`nDémarrage de la copie du File Share '$shareToCopy'..."
-        $azCopyCommand = "azcopy copy `"$sourceUrl`" `"$destinationUrl`" --recursive"
-        Write-Output "Exécution de la commande :"
-        Write-Output $azCopyCommand
-
-        try {
-            Invoke-Expression $azCopyCommand
-            if ($LASTEXITCODE -ne 0) {
-                Write-Output "Erreur lors de la copie du File Share '$shareToCopy'. Code de retour: $LASTEXITCODE"
-                continue
-            }
-        }
-        catch {
-            Write-Output "Exception lors de l'exécution de la commande AzCopy: $_"
-            continue
-        }
-
-        Write-Output "La copie du File Share '$shareToCopy' est terminée."
-
-        # Vérification du nombre de fichiers transférés
-        try {
-            $sourceCount = az storage file list --share-name $shareToCopy --account-name $sourceAccount --account-key $sourceKey --query "length([])" -o tsv
-            $destinationCount = az storage file list --share-name $shareToCopy --account-name $destinationAccount --account-key $destinationKey --query "length([])" -o tsv
-        }
-        catch {
-            Write-Output "Erreur lors de la vérification des fichiers transférés."
-            continue
-        }
-        Write-Output "Nombre de fichiers dans le File Share SOURCE: $sourceCount"
-        Write-Output "Nombre de fichiers dans le File Share DESTINATION: $destinationCount"
-        if ($sourceCount -ne $destinationCount) {
-            Write-Output "Attention : le nombre de fichiers transférés ne correspond pas entre la source et la destination."
-        }
-        else {
-            Write-Output "Vérification réussie : le nombre de fichiers correspond."
-        }
-
-        # Demander si l'utilisateur souhaite migrer un autre File Share
-        $continueResponse = Read-Host "`nVoulez-vous migrer un autre File Share ? (oui/non)"
-        if ($continueResponse -ne "oui") {
-            Write-Output "Fin du script de migration des File Shares."
-            break
+            Write-Host "AzCopy is required. Exiting."
+            exit
         }
     }
+    else {
+        return "azcopy"
+    }
 }
-else {
-    Write-Output "Type de migration non reconnu. Veuillez exécuter le script en spécifiant 'blob' ou 'fileshare'."
+
+# --- Check for required commands ---
+Check-Command -CommandName "az" -InstallURL "https://aka.ms/installazurecliwindows"
+$AzCopyPath = Check-AzCopy
+
+# --- Set up AzCopy log location to the log root (will be overridden per migration) ---
+$env:AZCOPY_LOG_LOCATION = $LogRoot
+
+# --- Function to compute an aggregated MD5 checksum for a Blob container ---
+function Get-ContainerChecksum {
+    param(
+        [Parameter(Mandatory = $true)] [string]$containerName,
+        [Parameter(Mandatory = $true)] [string]$accountName,
+        [Parameter(Mandatory = $true)] [string]$accountKey
+    )
+    try {
+        $blobListJson = az storage blob list --container-name $containerName --account-name $accountName --account-key $accountKey
+        $blobList = $blobListJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving blob list for container '$containerName'."
+        return $null
+    }
+    if (-not $blobList) { return "0" }
+    $sortedBlobs = $blobList | Sort-Object -Property name
+    $combined = ""
+    foreach ($blob in $sortedBlobs) {
+        if ($blob.contentSettings -and $blob.contentSettings.contentMd5) {
+            $combined += $blob.contentSettings.contentMd5
+        } else {
+            $combined += $blob.properties.contentLength
+        }
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($combined)
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    $hashBytes = $md5.ComputeHash($bytes)
+    $hashString = [System.BitConverter]::ToString($hashBytes) -replace "-", ""
+    return $hashString
+}
+
+# --- Function to compute an aggregated checksum for a File Share (based on file sizes) ---
+function Get-FileShareChecksum {
+    param(
+        [Parameter(Mandatory = $true)] [string]$shareName,
+        [Parameter(Mandatory = $true)] [string]$accountName,
+        [Parameter(Mandatory = $true)] [string]$accountKey
+    )
+    try {
+        $fileListJson = az storage file list --share-name $shareName --account-name $accountName --account-key $accountKey
+        $fileList = $fileListJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving file list for File Share '$shareName'."
+        return $null
+    }
+    if (-not $fileList) { return "0" }
+    $sortedFiles = $fileList | Sort-Object -Property name
+    $combined = ""
+    foreach ($file in $sortedFiles) {
+        $combined += $file.properties.contentLength
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($combined)
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    $hashBytes = $md5.ComputeHash($bytes)
+    $hashString = [System.BitConverter]::ToString($hashBytes) -replace "-", ""
+    return $hashString
+}
+
+############################################
+# Menu Functions
+############################################
+function Get-MainMenuChoice {
+    Clear-Host
+    Write-Host "=== MAIN MENU ==="
+    Write-Host "1. Blob Migration"
+    Write-Host "2. File Share Migration"
+    Write-Host "3. Quit"
+    do {
+        $inputStr = (Read-Host "Enter your choice (1-3)").Trim()
+        try { $choice = [int]$inputStr } catch { $choice = 0 }
+        if ($choice -ge 1 -and $choice -le 3) { return $choice }
+        else { Write-Host "Invalid choice. Please enter a number between 1 and 3." }
+    } while ($true)
+}
+
+function Get-BlobMenuChoice {
+    Clear-Host
+    Write-Host "=== BLOB MIGRATION MENU ==="
+    Write-Host "1. Scan SOURCE"
+    Write-Host "2. Scan DESTINATION"
+    Write-Host "3. Migrate a container"
+    Write-Host "4. Return to Main Menu"
+    do {
+        $inputStr = (Read-Host "Enter your choice (1-4)").Trim()
+        try { $choice = [int]$inputStr } catch { $choice = 0 }
+        if ($choice -ge 1 -and $choice -le 4) { return $choice }
+        else { Write-Host "Invalid choice. Please enter a number between 1 and 4." }
+    } while ($true)
+}
+
+function Get-FileShareMenuChoice {
+    Clear-Host
+    Write-Host "=== FILE SHARE MIGRATION MENU ==="
+    Write-Host "1. Scan SOURCE"
+    Write-Host "2. Scan DESTINATION"
+    Write-Host "3. Migrate a File Share"
+    Write-Host "4. Return to Main Menu"
+    do {
+        $inputStr = (Read-Host "Enter your choice (1-4)").Trim()
+        try { $choice = [int]$inputStr } catch { $choice = 0 }
+        if ($choice -ge 1 -and $choice -le 4) { return $choice }
+        else { Write-Host "Invalid choice. Please enter a number between 1 and 4." }
+    } while ($true)
+}
+
+############################################
+# Scan Functions
+############################################
+function Scan-BlobLocations {
+    Write-Host "`n=== SCAN OF BLOB CONTAINERS (SOURCE) ==="
+    try {
+        $containersJson = az storage container list --account-name $sourceAccount --account-key $sourceKey --query "[].name"
+        $containers = $containersJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving containers from the SOURCE account."
+        return
+    }
+    if ($containers) {
+        Write-Host "Containers in the SOURCE account ($sourceAccount):"
+        foreach ($c in $containers) { Write-Host " - $c" }
+    } else {
+        Write-Host "No containers found in the SOURCE account."
+    }
+}
+
+function Scan-BlobDestinations {
+    Write-Host "`n=== SCAN OF BLOB CONTAINERS (DESTINATION) ==="
+    try {
+        $containersJson = az storage container list --account-name $destinationAccount --account-key $destinationKey --query "[].name"
+        $containers = $containersJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving containers from the DESTINATION account."
+        return
+    }
+    if ($containers) {
+        Write-Host "Containers in the DESTINATION account ($destinationAccount):"
+        foreach ($c in $containers) { Write-Host " - $c" }
+    } else {
+        Write-Host "No containers found in the DESTINATION account."
+    }
+}
+
+function Scan-FileShareLocations {
+    Write-Host "`n=== SCAN OF FILE SHARES (SOURCE) ==="
+    try {
+        $sharesJson = az storage share list --account-name $sourceAccount --account-key $sourceKey --query "[].name"
+        $shares = $sharesJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving File Shares from the SOURCE account."
+        return
+    }
+    if ($shares) {
+        Write-Host "File Shares in the SOURCE account ($sourceAccount):"
+        foreach ($s in $shares) { Write-Host " - $s" }
+    } else {
+        Write-Host "No File Shares found in the SOURCE account."
+    }
+}
+
+function Scan-FileShareDestinations {
+    Write-Host "`n=== SCAN OF FILE SHARES (DESTINATION) ==="
+    try {
+        $sharesJson = az storage share list --account-name $destinationAccount --account-key $destinationKey --query "[].name"
+        $shares = $sharesJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving File Shares from the DESTINATION account."
+        return
+    }
+    if ($shares) {
+        Write-Host "File Shares in the DESTINATION account ($destinationAccount):"
+        foreach ($s in $shares) { Write-Host " - $s" }
+    } else {
+        Write-Host "No File Shares found in the DESTINATION account."
+    }
+}
+
+############################################
+# Migration Functions
+############################################
+function Migrate-BlobContainer {
+    param (
+        [string]$containerName
+    )
+    
+    # Check existence in the source
+    try {
+        $srcContainersJson = az storage container list --account-name $sourceAccount --account-key $sourceKey --query "[].name"
+        $srcContainers = $srcContainersJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving containers from the SOURCE account."
+        return
+    }
+    if (-not ($srcContainers -contains $containerName)) {
+        Write-Host "The container '$containerName' does not exist in the source."
+        return
+    }
+    
+    # Check existence in the destination
+    try {
+        $dstContainersJson = az storage container list --account-name $destinationAccount --account-key $destinationKey --query "[].name"
+        $dstContainers = $dstContainersJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving containers from the DESTINATION account."
+        return
+    }
+    if (-not ($dstContainers -contains $containerName)) {
+        Write-Host "The container '$containerName' does not exist in the destination."
+        $resp = (Read-Host "Do you want to create it? (yes/no)").Trim().ToLower()
+        if ($resp -eq "yes" -or $resp -eq "y") {
+            # Retrieve source container properties
+            try {
+                $srcContainerJson = az storage container show --name $containerName --account-name $sourceAccount --account-key $sourceKey
+                $srcContainer = $srcContainerJson | ConvertFrom-Json
+            } catch {
+                Write-Host "Error retrieving properties for container '$containerName' from the SOURCE account."
+                return
+            }
+            # Extract public access and metadata using PSObject.Properties
+            $publicAccess = $srcContainer.publicAccess
+            $metadataStr = ""
+            if ($srcContainer.metadata -and $srcContainer.metadata.PSObject.Properties.Count -gt 0) {
+                $metadataStr = ($srcContainer.metadata.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " "
+            }
+            $createCmd = "az storage container create --name $containerName --account-name $destinationAccount --account-key $destinationKey"
+            if ($publicAccess) { $createCmd += " --public-access $publicAccess" }
+            if ($metadataStr -ne "") { $createCmd += " --metadata $metadataStr" }
+            Write-Host "Creating container '$containerName' in the destination with properties:"
+            Write-Host "  Public Access: $publicAccess"
+            Write-Host "  Metadata: $metadataStr"
+            try {
+                Invoke-Expression $createCmd | Out-Null
+                Write-Host "Container '$containerName' created in the destination."
+            } catch {
+                Write-Host "Error creating the container '$containerName' in the destination."
+                return
+            }
+        } else {
+            Write-Host "Migration canceled."
+            return
+        }
+    }
+    
+    # Compute source checksum before migration
+    Write-Host "`nComputing source container checksum for '$containerName'..."
+    $sourceChecksum = Get-ContainerChecksum -containerName $containerName -accountName $sourceAccount -accountKey $sourceKey
+    Write-Host "Source container checksum: $sourceChecksum"
+    
+    # Create a log folder for this migration: combine container name and timestamp
+    $timestamp = (Get-Date -Format "yyyyMMdd_HHmmss")
+    $logFolderName = "$containerName" + "_" + $timestamp
+    $logFolder = Join-Path $LogRoot $logFolderName
+    if (!(Test-Path $logFolder)) {
+        New-Item -ItemType Directory -Path $logFolder -Force | Out-Null
+    }
+    # Set AzCopy log location to this folder
+    $env:AZCOPY_LOG_LOCATION = $logFolder
+    
+    # Build URLs for AzCopy
+    $srcUrl = "https://$sourceAccount.blob.core.windows.net/$containerName$sourceSas"
+    $dstUrl = "https://$destinationAccount.blob.core.windows.net/$containerName$destinationSas"
+    
+    Write-Host "`nStarting migration of container '$containerName'..."
+    $cmd = "$AzCopyPath copy `"$srcUrl`" `"$dstUrl`" --recursive --check-md5=FailIfDifferent"
+    Write-Host "Command: $cmd"
+    try {
+        Invoke-Expression $cmd
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Error during migration of container '$containerName'. Code: $LASTEXITCODE"
+            return
+        }
+    } catch {
+        Write-Host "Exception during migration: $_"
+        return
+    }
+    Write-Host "Migration completed for container '$containerName'."
+    
+    # Compute destination checksum after migration
+    Write-Host "`nComputing destination container checksum for '$containerName'..."
+    $destChecksum = Get-ContainerChecksum -containerName $containerName -accountName $destinationAccount -accountKey $destinationKey
+    Write-Host "Destination container checksum: $destChecksum"
+    
+    Write-Host "`nSUMMARY for container '$containerName':"
+    Write-Host "  Source checksum:      $sourceChecksum"
+    Write-Host "  Destination checksum: $destChecksum"
+    if ($sourceChecksum -eq $destChecksum) {
+        Write-Host "Checksum verification successful: The container checksums match."
+    } else {
+        Write-Host "Checksum verification FAILED: The container checksums do not match."
+    }
+}
+
+function Migrate-FileShare {
+    param (
+        [string]$shareName
+    )
+    
+    # Check existence in the source
+    try {
+        $srcSharesJson = az storage share list --account-name $sourceAccount --account-key $sourceKey --query "[].name"
+        $srcShares = $srcSharesJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving File Shares from the SOURCE account."
+        return
+    }
+    if (-not ($srcShares -contains $shareName)) {
+        Write-Host "The File Share '$shareName' does not exist in the source."
+        return
+    }
+    
+    # Check existence in the destination
+    try {
+        $dstSharesJson = az storage share list --account-name $destinationAccount --account-key $destinationKey --query "[].name"
+        $dstShares = $dstSharesJson | ConvertFrom-Json
+    } catch {
+        Write-Host "Error retrieving File Shares from the DESTINATION account."
+        return
+    }
+    if (-not ($dstShares -contains $shareName)) {
+        Write-Host "The File Share '$shareName' does not exist in the destination."
+        $resp = (Read-Host "Do you want to create it? (yes/no)").Trim().ToLower()
+        if ($resp -eq "yes" -or $resp -eq "y") {
+            # Retrieve source File Share properties
+            try {
+                $srcShareJson = az storage share show --name $shareName --account-name $sourceAccount --account-key $sourceKey
+                $srcShare = $srcShareJson | ConvertFrom-Json
+            } catch {
+                Write-Host "Error retrieving properties for File Share '$shareName' from the SOURCE account."
+                return
+            }
+            $quota = $srcShare.quota
+            $metadataStr = ""
+            if ($srcShare.metadata -and $srcShare.metadata.PSObject.Properties.Count -gt 0) {
+                $metadataStr = ($srcShare.metadata.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " "
+            }
+            $createCmd = "az storage share create --name $shareName --account-name $destinationAccount --account-key $destinationKey"
+            if ($quota) { $createCmd += " --quota $quota" }
+            if ($metadataStr -ne "") { $createCmd += " --metadata $metadataStr" }
+            Write-Host "Creating File Share '$shareName' in the destination with properties:"
+            Write-Host "  Quota: $quota"
+            Write-Host "  Metadata: $metadataStr"
+            try {
+                Invoke-Expression $createCmd | Out-Null
+                Write-Host "File Share '$shareName' created in the destination."
+            } catch {
+                Write-Host "Error creating the File Share '$shareName'."
+                return
+            }
+        } else {
+            Write-Host "Migration canceled."
+            return
+        }
+    }
+    
+    # Compute source checksum before migration
+    Write-Host "`nComputing source File Share checksum for '$shareName'..."
+    $sourceChecksum = Get-FileShareChecksum -shareName $shareName -accountName $sourceAccount -accountKey $sourceKey
+    Write-Host "Source File Share checksum: $sourceChecksum"
+    
+    # Create a log folder for this migration: combine share name and timestamp
+    $timestamp = (Get-Date -Format "yyyyMMdd_HHmmss")
+    $logFolderName = "$shareName" + "_" + $timestamp
+    $logFolder = Join-Path $LogRoot $logFolderName
+    if (!(Test-Path $logFolder)) {
+        New-Item -ItemType Directory -Path $logFolder -Force | Out-Null
+    }
+    # Set AzCopy log location to this folder
+    $env:AZCOPY_LOG_LOCATION = $logFolder
+    
+    # Build URLs for AzCopy
+    $srcUrl = "https://$sourceAccount.file.core.windows.net/$shareName$sourceSas"
+    $dstUrl = "https://$destinationAccount.file.core.windows.net/$shareName$destinationSas"
+    
+    Write-Host "`nStarting migration of File Share '$shareName'..."
+    $cmd = "$AzCopyPath copy `"$srcUrl`" `"$dstUrl`" --recursive"
+    Write-Host "Command: $cmd"
+    try {
+        Invoke-Expression $cmd
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Error during migration of File Share '$shareName'. Code: $LASTEXITCODE"
+            return
+        }
+    } catch {
+        Write-Host "Exception during migration: $_"
+        return
+    }
+    Write-Host "Migration completed for File Share '$shareName'."
+    
+    # Compute destination checksum after migration
+    Write-Host "`nComputing destination File Share checksum for '$shareName'..."
+    $destChecksum = Get-FileShareChecksum -shareName $shareName -accountName $destinationAccount -accountKey $destinationKey
+    Write-Host "Destination File Share checksum: $destChecksum"
+    
+    Write-Host "`nSUMMARY for File Share '$shareName':"
+    Write-Host "  Source checksum:      $sourceChecksum"
+    Write-Host "  Destination checksum: $destChecksum"
+    if ($sourceChecksum -eq $destChecksum) {
+        Write-Host "Checksum verification successful: The File Share checksums match."
+    } else {
+        Write-Host "Checksum verification FAILED: The File Share checksums do not match."
+    }
+}
+
+############################################
+# Main Menu Loop
+############################################
+$continueMain = $true
+while ($continueMain) {
+    $mainChoice = Get-MainMenuChoice
+    switch ($mainChoice) {
+        1 {
+            # Blob Migration
+            $continueBlob = $true
+            while ($continueBlob) {
+                $blobChoice = Get-BlobMenuChoice
+                switch ($blobChoice) {
+                    1 { Scan-BlobLocations; Pause }
+                    2 { Scan-BlobDestinations; Pause }
+                    3 { 
+                        $containerName = (Read-Host "Enter the name of the container to migrate").Trim()
+                        Migrate-BlobContainer -containerName $containerName
+                        Pause
+                    }
+                    4 { $continueBlob = $false }
+                }
+            }
+        }
+        2 {
+            # File Share Migration
+            $continueFS = $true
+            while ($continueFS) {
+                $fsChoice = Get-FileShareMenuChoice
+                switch ($fsChoice) {
+                    1 { Scan-FileShareLocations; Pause }
+                    2 { Scan-FileShareDestinations; Pause }
+                    3 { 
+                        $shareName = (Read-Host "Enter the name of the File Share to migrate").Trim()
+                        Migrate-FileShare -shareName $shareName
+                        Pause
+                    }
+                    4 { $continueFS = $false }
+                }
+            }
+        }
+        3 {
+            Write-Host "Goodbye!"
+            $continueMain = $false
+        }
+    }
 }
